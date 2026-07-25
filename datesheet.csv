@@ -1,0 +1,34 @@
+Date,SubCode,Subject,Department
+01-06-2026,IAS203,Mathematics-II,BTech
+03-06-2026,ISE201,Emerging Trends- 2,BTech
+05-06-2026,IAS201,Engineering Physics,BTech
+08-06-2026,IEM201,Trends in Electrical and Mechanical Engineering,BTech
+02-06-2026,IBBA202,Managerial Economics,BBA
+04-06-2026,IBBA203,Cost and Management Accounting,BBA
+06-06-2026,IBBA201,Organizational Behavior,BBA
+09-06-2026,IBBA205,Marketing Management,BBA
+11-06-2026,IBBA206,IT Application - II,BBA
+13-06-2026,IBBA204,Basics of Statistics,BBA
+15-06-2026,IBBA207,Innovation And Entrepreneurship,BBA
+02-06-2026,IBC202,Discrete Math,BCA
+04-06-2026,IBC205,Cyber Security,BCA
+06-06-2026,IBC201,Python Programming,BCA
+09-06-2026,IBC203,Data Structure using C,BCA
+11-06-2026,IBC204,Digital Electronics,BCA
+02-06-2026,IMTCS201,High Performance Computing,MTech
+04-06-2026,IMTCS031,Big Data Analytics,MTech
+06-06-2026,IMTCS042,Deep Learning,MTech
+09-06-2026,IMTCS203,Advanced Software Engineering,MTech
+11-06-2026,IMTCS202,Advanced Wireless Networks,MTech
+02-06-2026,IBMB206,Business Analytics,MBA
+04-06-2026,IBMB202,Human Resource Management,MBA
+06-06-2026,IBMB203,Business Research Methods,MBA
+09-06-2026,IBMB204,Corporate Finance & Fintech,MBA
+11-06-2026,IBMB205,Operations Management,MBA
+13-06-2026,IBMB201,Business Environment,MBA
+15-06-2026,IBMB207,Strategic Management,MBA
+02-06-2026,IMC201,Object Oriented Programming with Java,MCA
+04-06-2026,IMC213,Design Thinking,MCA
+06-06-2026,IMC204,Web Technology,MCA
+09-06-2026,IMC203,Design and Analysis of Algorithms,MCA
+11-06-2026,IMC202,Operating System,MCA
