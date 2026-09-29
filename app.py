@@ -1,7 +1,97 @@
 import streamlit as st
 import pandas as pd
 
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
 MAX_PLAN_RETRIES = 5
+
+
+def parse_available_rooms(uploaded_file):
+    """Read available room numbers from a CSV or PDF upload."""
+    if uploaded_file is None:
+        return [], []
+
+    file_name = uploaded_file.name.lower()
+    rooms = []
+    invalid_values = []
+
+    try:
+        if file_name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+            df.columns = df.columns.str.strip()
+
+            # Accept common room-number column names.
+            possible_columns = [
+                "Room", "Room_Number", "Room Number", "RoomNo",
+                "Room_No", "room", "room_number"
+            ]
+            room_column = next(
+                (col for col in possible_columns if col in df.columns), None
+            )
+
+            if room_column is None:
+                # Also allow a single-column CSV without a header.
+                uploaded_file.seek(0)
+                raw_df = pd.read_csv(uploaded_file, header=None)
+                if raw_df.shape[1] == 1:
+                    values = raw_df.iloc[:, 0].tolist()
+                else:
+                    return [], [
+                        "CSV must contain a room-number column such as "
+                        "'Room' or 'Room_Number'."
+                    ]
+            else:
+                values = df[room_column].tolist()
+
+        elif file_name.endswith(".pdf"):
+            if PdfReader is None:
+                return [], [
+                    "PDF support requires the 'pypdf' package. "
+                    "Install it with: pip install pypdf"
+                ]
+
+            uploaded_file.seek(0)
+            reader = PdfReader(uploaded_file)
+            pdf_text = "\n".join(
+                page.extract_text() or "" for page in reader.pages
+            )
+
+            # Extract standalone room numbers from PDF text.
+            import re
+            values = re.findall(r"(?<!\d)\d{1,5}(?!\d)", pdf_text)
+
+        else:
+            return [], ["Unsupported file type. Please upload CSV or PDF."]
+
+        for value in values:
+            value_str = str(value).strip()
+
+            if not value_str or value_str.lower() in {"nan", "none", "room"}:
+                continue
+
+            # Handle values such as "Room 101" / "101.0".
+            import re
+            match = re.search(r"(?<!\d)(\d{1,5})(?:\.0)?(?!\d)", value_str)
+            if match:
+                room_number = int(match.group(1))
+                if room_number > 0:
+                    rooms.append(room_number)
+                else:
+                    invalid_values.append(value_str)
+            else:
+                invalid_values.append(value_str)
+
+        # Remove duplicates while preserving source order.
+        rooms = list(dict.fromkeys(rooms))
+
+    except Exception as exc:
+        return [], [f"Could not read the room file: {exc}"]
+
+    return rooms, invalid_values
+
 
 
 def build_seating_record(room_number, row, desk, seat, student, department_subjects):
@@ -24,173 +114,221 @@ def generate_pair_seating_plan(
     rows_per_room,
     desks_per_row,
     students_per_desk,
-    selected_pair,
+    course_pairs,
+    single_course_departments,
     department_subjects,
     retry_number=0,
 ):
     """
-    Generate seating using the teacher-selected course pair.
+    Generate seating according to the teacher's explicit course configuration.
 
-    If a pair is selected, students from those two departments are placed
-    on opposite seats of the same desk whenever both are available.
-    Once either department runs out, the remaining students are seated
-    normally. No subject comparison is used.
+    - Every pair in course_pairs gets paired seating: one student from each
+      course on opposite sides of a desk.
+    - Every course in single_course_departments gets single seating:
+      one student per desk.
+    - Multiple teacher-selected pairs are supported.
+    - Rooms are never shared between different seating groups.
     """
-    students = active_students.sort_values(
-        by=["Department", "Roll_Number"]
-    )
+    course_pairs = course_pairs or []
+    single_course_departments = single_course_departments or []
 
-    queues = {
-        department: students[
-            students["Department"] == department
-        ].to_dict("records")
-        for department in active_departments
-    }
+    students = active_students.sort_values(by=["Department", "Roll_Number"])
 
-    # Retry by rotating the order of non-paired departments.
-    if retry_number:
-        departments = list(active_departments)
-        shift = retry_number % len(departments) if departments else 0
-        rotated = departments[shift:] + departments[:shift]
-        queues = {
-            department: students[
-                students["Department"] == department
-            ].to_dict("records")
-            for department in rotated
-        }
+    groups = []
+    paired_courses = set()
 
-    pair_a, pair_b = selected_pair if selected_pair else (None, None)
+    for pair in course_pairs:
+        if len(pair) != 2:
+            continue
+        pair_a, pair_b = pair
+        groups.append({
+            "type": "Paired",
+            "departments": [pair_a, pair_b],
+        })
+        paired_courses.update([pair_a, pair_b])
+
+    for department in single_course_departments:
+        if department not in paired_courses:
+            groups.append({
+                "type": "Single",
+                "departments": [department],
+            })
 
     seating_plan = []
-    room_capacity = rows_per_room * desks_per_row * students_per_desk
-    total_capacity = len(available_rooms) * room_capacity
+    room_index = 0
 
-    if len(active_students) > total_capacity:
-        return pd.DataFrame()
+    def room_capacity_for(group_type):
+        if group_type == "Paired" and students_per_desk == 2:
+            return rows_per_room * desks_per_row * 2
+        return rows_per_room * desks_per_row
 
-    # Keep the selected pair at the front of the seating process.
-    ordered_departments = list(active_departments)
-    if pair_a in ordered_departments:
-        ordered_departments.remove(pair_a)
-        ordered_departments.insert(0, pair_a)
-    if pair_b in ordered_departments:
-        ordered_departments.remove(pair_b)
-        ordered_departments.insert(1 if pair_a else 0, pair_b)
+    def build_group_seating(group, rooms):
+        departments = group["departments"]
+        group_students = students[
+            students["Department"].isin(departments)
+        ].copy()
 
-    def get_next_normal_student():
-        for department in ordered_departments:
-            if queues.get(department):
-                return queues[department].pop(0)
-        return None
+        if group_students.empty:
+            return []
 
-    for room_number in available_rooms:
-        for row in range(1, rows_per_room + 1):
-            for desk in range(1, desks_per_row + 1):
-                if not any(queues.get(dept) for dept in queues):
-                    break
+        if retry_number:
+            group_students = group_students.sort_values(
+                by=["Department", "Roll_Number"]
+            )
 
-                # One seat per desk: normal sequential seating.
-                if students_per_desk == 1:
-                    student = get_next_normal_student()
-                    if student:
-                        seating_plan.append(
-                            build_seating_record(
-                                room_number,
-                                row,
-                                desk,
-                                "Left",
-                                student,
-                                department_subjects,
+        records = []
+
+        if group["type"] == "Paired" and students_per_desk == 2:
+            queues = {
+                department: group_students[
+                    group_students["Department"] == department
+                ].to_dict("records")
+                for department in departments
+            }
+
+            for room_number in rooms:
+                for row in range(1, rows_per_room + 1):
+                    for desk in range(1, desks_per_row + 1):
+                        if not any(queues.get(d) for d in queues):
+                            break
+
+                        left = queues.get(departments[0], [])
+                        right = queues.get(departments[1], [])
+
+                        student_a = left.pop(0) if left else None
+                        student_b = right.pop(0) if right else None
+
+                        if student_a is None and student_b is None:
+                            continue
+
+                        if student_a:
+                            record = build_seating_record(
+                                room_number, row, desk, "Left",
+                                student_a, department_subjects
                             )
+                            record["Plan_Type"] = "Paired"
+                            record["Course_Group"] = (
+                                f"{departments[0]} + {departments[1]}"
+                            )
+                            records.append(record)
+
+                        if student_b:
+                            record = build_seating_record(
+                                room_number, row, desk, "Right",
+                                student_b, department_subjects
+                            )
+                            record["Plan_Type"] = "Paired"
+                            record["Course_Group"] = (
+                                f"{departments[0]} + {departments[1]}"
+                            )
+                            records.append(record)
+
+        else:
+            queue = group_students.to_dict("records")
+
+            for room_number in rooms:
+                for row in range(1, rows_per_room + 1):
+                    for desk in range(1, desks_per_row + 1):
+                        if not queue:
+                            break
+
+                        student = queue.pop(0)
+                        record = build_seating_record(
+                            room_number, row, desk, "Left",
+                            student, department_subjects
                         )
-                    continue
+                        record["Plan_Type"] = "Single"
+                        record["Course_Group"] = departments[0]
+                        records.append(record)
 
-                # Two seats per desk: honor the selected pair IF both
-                # departments still have students.
-                student_a = None
-                student_b = None
+        if len(records) != len(group_students):
+            return None
 
-                if pair_a and pair_b and queues.get(pair_a) and queues.get(pair_b):
-                    student_a = queues[pair_a].pop(0)
-                    student_b = queues[pair_b].pop(0)
-                else:
-                    # Pairing is not compulsory. If one selected course has
-                    # run out, fill the desk normally with remaining students.
-                    student_a = get_next_normal_student()
-                    student_b = get_next_normal_student()
+        return records
 
-                    # Avoid placing the exact same student twice.
-                    if (
-                        student_a is not None
-                        and student_b is not None
-                        and student_a["Roll_Number"] == student_b["Roll_Number"]
-                    ):
-                        student_b = get_next_normal_student()
+    # Allocate rooms sequentially. A room is owned by exactly one group.
+    for group in groups:
+        group_students_count = len(
+            students[students["Department"].isin(group["departments"])]
+        )
+        capacity_per_room = room_capacity_for(group["type"])
 
-                if student_a:
-                    seating_plan.append(
-                        build_seating_record(
-                            room_number,
-                            row,
-                            desk,
-                            "Left",
-                            student_a,
-                            department_subjects,
-                        )
-                    )
+        rooms_needed = (
+            (group_students_count + capacity_per_room - 1)
+            // capacity_per_room
+        )
 
-                if student_b:
-                    seating_plan.append(
-                        build_seating_record(
-                            room_number,
-                            row,
-                            desk,
-                            "Right",
-                            student_b,
-                            department_subjects,
-                        )
-                    )
+        group_rooms = available_rooms[
+            room_index:room_index + rooms_needed
+        ]
 
-    return pd.DataFrame(seating_plan)
+        if len(group_rooms) < rooms_needed:
+            return pd.DataFrame()
+
+        group_records = build_group_seating(group, group_rooms)
+        if group_records is None:
+            return pd.DataFrame()
+
+        seating_plan.extend(group_records)
+        room_index += rooms_needed
+
+    if seating_plan:
+        result = pd.DataFrame(seating_plan)
+
+        # Final safety check: no room may contain more than one seating type
+        # or more than one course group.
+        room_types = result.groupby("Room")["Plan_Type"].nunique()
+        room_groups = result.groupby("Room")["Course_Group"].nunique()
+
+        if (room_types > 1).any() or (room_groups > 1).any():
+            return pd.DataFrame()
+
+        return result
+
+    return pd.DataFrame()
 
 
-def find_pairing_violations(seating_df, selected_pair):
+def find_pairing_violations(seating_df, course_pairs):
     """
-    Find desks where the teacher-selected pair could have been used but was
-    not used. This is informational only; pairing is a preference/IF rule,
-    not a hard constraint.
+    Find desks where a teacher-selected pair could not be maintained because
+    one course ran out of students. This is informational only.
     """
-    if seating_df.empty or not selected_pair:
+    if seating_df.empty or not course_pairs:
         return []
 
-    pair_a, pair_b = selected_pair
     violations = []
 
-    for (room, row, desk), desk_seats in seating_df.groupby(
-        ["Room", "Row", "Desk"]
-    ):
-        departments = set(desk_seats["Department"].tolist())
+    for pair_a, pair_b in course_pairs:
+        pair_text = f"{pair_a} + {pair_b}"
 
-        if pair_a in departments and pair_b not in departments:
-            violations.append(
-                {
+        pair_df = seating_df[
+            seating_df["Course_Group"] == pair_text
+        ]
+
+        if pair_df.empty:
+            continue
+
+        for (room, row, desk), desk_seats in pair_df.groupby(
+            ["Room", "Row", "Desk"]
+        ):
+            departments = set(desk_seats["Department"].tolist())
+
+            if pair_a in departments and pair_b not in departments:
+                violations.append({
                     "Room": room,
                     "Row": row,
                     "Desk": desk,
-                    "Selected Pair": f"{pair_a} + {pair_b}",
+                    "Selected Pair": pair_text,
                     "Note": f"{pair_b} was not available for this desk.",
-                }
-            )
-        elif pair_b in departments and pair_a not in departments:
-            violations.append(
-                {
+                })
+            elif pair_b in departments and pair_a not in departments:
+                violations.append({
                     "Room": room,
                     "Row": row,
                     "Desk": desk,
-                    "Selected Pair": f"{pair_a} + {pair_b}",
+                    "Selected Pair": pair_text,
                     "Note": f"{pair_a} was not available for this desk.",
-                }
-            )
+                })
 
     return violations
 
@@ -294,91 +432,205 @@ if date_sheet_file and roster_file:
     if not active_students.empty:
 
         # ------------------------------------------
-        # TEACHER CONTROLLED COURSE PAIRING
+        # TEACHER-CONTROLLED COURSE SEATING CONFIGURATION
         # ------------------------------------------
-        st.subheader("👥 Select Course Pairing")
+        st.subheader("👥 Course Seating Configuration")
+        st.caption(
+            "You decide exactly which courses are paired and which courses "
+            "are single. You can create multiple pairs."
+        )
 
-        if len(active_departments) >= 2:
-            pair_col1, pair_col2 = st.columns(2)
+        course_pairs = []
+        single_course_departments = []
+        course_pair_choice = {}
 
-            with pair_col1:
-                selected_course_1 = st.selectbox(
-                    "Course 1",
-                    active_departments,
-                    key=f"course_pair_1_{selected_date}",
-                )
+        # When the teacher selects a course to pair with another course,
+        # automatically select the reciprocal pairing as well. This means:
+        # BBA -> Pair with BCA  ==>  BCA -> Pair with BBA automatically.
+        def sync_course_pair(course, selected_date, active_courses):
+            key = f"course_seating_{selected_date}_{course}"
+            previous_key = f"course_previous_choice_{selected_date}_{course}"
+            choice = st.session_state.get(key, "Single")
+            previous_choice = st.session_state.get(previous_key, "Single")
 
-            remaining_course_options = [
-                course
-                for course in active_departments
-                if course != selected_course_1
+            # First remove this course's OLD reciprocal pairing, if it had one.
+            # Example: BBA was paired with BCA, then the teacher changes BBA
+            # to pair with MCA. BCA must automatically become Single.
+            if previous_choice.startswith("Pair with "):
+                old_partner = previous_choice.replace("Pair with ", "", 1)
+                old_partner_key = f"course_seating_{selected_date}_{old_partner}"
+                if st.session_state.get(old_partner_key) == f"Pair with {course}":
+                    st.session_state[old_partner_key] = "Single"
+
+            if choice.startswith("Pair with "):
+                partner = choice.replace("Pair with ", "", 1)
+                partner_key = f"course_seating_{selected_date}_{partner}"
+
+                # If the new partner already belongs to another pair, break
+                # that old pair so every course can belong to only one pair.
+                partner_old_choice = st.session_state.get(partner_key, "Single")
+                if partner_old_choice.startswith("Pair with "):
+                    partner_old_partner = partner_old_choice.replace(
+                        "Pair with ", "", 1
+                    )
+                    if partner_old_partner != course:
+                        other_key = (
+                            f"course_seating_{selected_date}_{partner_old_partner}"
+                        )
+                        if st.session_state.get(other_key) == f"Pair with {partner}":
+                            st.session_state[other_key] = "Single"
+
+                # Automatically select the reciprocal pairing.
+                st.session_state[partner_key] = f"Pair with {course}"
+
+            st.session_state[previous_key] = choice
+
+        for course in active_departments:
+            other_courses = [
+                c for c in active_departments
+                if c != course
             ]
 
-            with pair_col2:
-                selected_course_2 = st.selectbox(
-                    "Course 2",
-                    remaining_course_options,
-                    key=f"course_pair_2_{selected_date}",
+            options = ["Single"] + [
+                f"Pair with {other}" for other in other_courses
+            ]
+            key = f"course_seating_{selected_date}_{course}"
+
+            if key not in st.session_state:
+                st.session_state[key] = "Single"
+
+            course_pair_choice[course] = st.selectbox(
+                f"Seating for **{course}**",
+                options,
+                key=key,
+                on_change=sync_course_pair,
+                args=(course, selected_date, active_departments),
+            )
+
+        # Convert the now-synchronised teacher choices into unique pairs.
+        # No manual reciprocal selection is required anymore.
+        configuration_errors = []
+        for course in active_departments:
+            choice = course_pair_choice.get(course, "Single")
+
+            if choice == "Single":
+                single_course_departments.append(course)
+                continue
+
+            partner = choice.replace("Pair with ", "", 1)
+            if partner not in active_departments or partner == course:
+                configuration_errors.append(
+                    f"{course} has an invalid pairing selection."
                 )
+                continue
 
-            selected_pair = (
-                selected_course_1,
-                selected_course_2,
+            # This should normally be automatic because of the callback, but
+            # validate it as a safety check before generating the plan.
+            partner_choice = course_pair_choice.get(partner, "Single")
+            if partner_choice != f"Pair with {course}":
+                configuration_errors.append(
+                    f"{course} is set to pair with {partner}, but {partner} "
+                    f"is not set to pair with {course}."
+                )
+                continue
+
+            pair = tuple(sorted((course, partner)))
+            if pair not in course_pairs:
+                course_pairs.append(pair)
+
+
+        # Courses involved in a pair cannot also be single.
+        paired_courses = {
+            course
+            for pair in course_pairs
+            for course in pair
+        }
+        single_course_departments = [
+            course
+            for course in active_departments
+            if course not in paired_courses
+            and course_pair_choice.get(course) == "Single"
+        ]
+
+        if course_pairs:
+            st.success(
+                "✅ Courses you chose to pair: "
+                + ", ".join(f"{a} + {b}" for a, b in course_pairs)
             )
-
+        if single_course_departments:
             st.info(
-                f"Selected pairing: **{selected_course_1} + "
-                f"{selected_course_2}**. "
-                "When students from both courses are available, they "
-                "will be seated on opposite sides of the same desk."
+                "📌 Courses you chose as Single: "
+                + ", ".join(single_course_departments)
             )
-        else:
-            selected_pair = None
-            st.info(
-                "Only one course is active today, so course pairing is "
-                "not required."
-            )
+        if not course_pairs and not single_course_departments:
+            st.warning("Please configure at least one course.")
 
-        # ------------------------------------------
+        # Backward-compatible summary used by the rest of the app.
+        selected_pair = course_pairs[0] if course_pairs else None
+
+        current_course_config = (
+            tuple(sorted(tuple(sorted(pair)) for pair in course_pairs)),
+            tuple(sorted(single_course_departments)),
+            tuple(sorted(course_pair_choice.items())),
+        )
+        course_config_key = f"course_config_{selected_date}"
+
+        if st.session_state.get(course_config_key) != current_course_config:
+            st.session_state.pop("candidate_seating_df", None)
+            st.session_state.pop("seating_df", None)
+            st.session_state.pop("retry_seating_plan", None)
+            st.session_state["plan_retry_count"] = 0
+            st.session_state["confirm_plan_download"] = False
+            st.session_state[course_config_key] = current_course_config
+
         # ACTUAL AVAILABLE ROOMS
         # ------------------------------------------
         st.subheader("🏫 Available Examination Rooms")
 
         st.caption(
-            "Enter only rooms that are actually available for this exam. "
-            "Room numbers do not need to be consecutive."
+            "Upload a CSV or PDF containing the rooms that are actually "
+            "available for this exam. Room numbers do not need to be consecutive."
         )
 
-        room_input = st.text_input(
-            "Room Numbers",
-            value="101, 102, 105, 106",
-            key=f"room_input_{selected_date}",
-            help="Example: 101, 102, 105, 110, 205",
+        room_file = st.file_uploader(
+            "Upload Available Rooms (CSV or PDF)",
+            type=["csv", "pdf"],
+            key=f"room_file_{selected_date}",
+            help=(
+                "CSV: use a column named Room, Room_Number, Room Number, "
+                "RoomNo, or Room_No. PDF: room numbers can appear as text, "
+                "for example 101, 102, 105."
+            ),
         )
 
         available_rooms = []
         invalid_room_values = []
 
-        for value in room_input.split(","):
-            value = value.strip()
-            if not value:
-                continue
-            try:
-                room_number = int(value)
-                if room_number > 0:
-                    available_rooms.append(room_number)
-                else:
-                    invalid_room_values.append(value)
-            except ValueError:
-                invalid_room_values.append(value)
+        if room_file is not None:
+            available_rooms, invalid_room_values = parse_available_rooms(
+                room_file
+            )
 
-        # Remove duplicate rooms while preserving order.
-        available_rooms = list(dict.fromkeys(available_rooms))
+            if available_rooms:
+                st.success(
+                    f"✅ Loaded {len(available_rooms)} available room(s): "
+                    + ", ".join(map(str, available_rooms))
+                )
+            else:
+                st.error(
+                    "⚠️ No valid room numbers were found in the uploaded file."
+                )
 
-        if invalid_room_values:
-            st.warning(
-                "Ignored invalid room numbers: "
-                + ", ".join(invalid_room_values)
+            if invalid_room_values:
+                st.warning(
+                    "Ignored invalid room values: "
+                    + ", ".join(invalid_room_values[:20])
+                    + (" ..." if len(invalid_room_values) > 20 else "")
+                )
+        else:
+            st.info(
+                "Please upload the available-room CSV/PDF before generating "
+                "the seating plan."
             )
 
         # ------------------------------------------
@@ -416,11 +668,57 @@ if date_sheet_file and roster_file:
                 key=f"students_per_desk_{selected_date}",
             )
 
+        # Pairing requires two students per desk.
+        # This check MUST happen after students_per_desk is created.
+        if course_pairs and students_per_desk != 2:
+            configuration_errors.append(
+                "At least one course pair is selected, so Students per Desk "
+                "must be 2."
+            )
+
         seats_per_room = (
             rows_per_room * desks_per_row * students_per_desk
         )
-        total_capacity = len(available_rooms) * seats_per_room
         total_students = len(active_students)
+
+        # Calculate the actual number of rooms required from the
+        # teacher-selected pairs and singles.
+        pair_capacity_per_room = rows_per_room * desks_per_row * 2
+        single_capacity_per_room = rows_per_room * desks_per_row
+
+        pair_rooms_required = 0
+        for pair in course_pairs:
+            count = len(
+                active_students[
+                    active_students["Department"].isin(pair)
+                ]
+            )
+            pair_rooms_required += (
+                (count + pair_capacity_per_room - 1)
+                // pair_capacity_per_room
+                if count
+                else 0
+            )
+
+        single_rooms_required = 0
+        for department in single_course_departments:
+            count = len(
+                active_students[
+                    active_students["Department"] == department
+                ]
+            )
+            single_rooms_required += (
+                (count + single_capacity_per_room - 1)
+                // single_capacity_per_room
+                if count
+                else 0
+            )
+
+        required_rooms = pair_rooms_required + single_rooms_required
+        total_capacity = (
+            pair_rooms_required * pair_capacity_per_room
+            + single_rooms_required * single_capacity_per_room
+        )
 
         cap_col1, cap_col2, cap_col3 = st.columns(3)
 
@@ -428,51 +726,52 @@ if date_sheet_file and roster_file:
             st.metric("Students", total_students)
 
         with cap_col2:
-            st.metric("Available Seats", total_capacity)
+            st.metric("Rooms Required", required_rooms)
 
         with cap_col3:
-            if total_capacity >= total_students:
-                st.success("Capacity: Sufficient")
+            if len(available_rooms) >= required_rooms:
+                st.success(
+                    f"Rooms Available: {len(available_rooms)}"
+                )
             else:
                 st.error(
-                    f"Capacity: Short by "
-                    f"{total_students - total_capacity} seats"
+                    f"Rooms Short by {required_rooms - len(available_rooms)}"
                 )
 
         # ------------------------------------------
-        # GENERATE SEATING
+        # GENERATE / RETRY SEATING PLAN
         # ------------------------------------------
+        if configuration_errors:
+            st.error(
+                "⚠️ Fix the course pairing configuration above before "
+                "generating the seating plan."
+            )
+            st.stop()
+
+        if len(available_rooms) < required_rooms:
+            st.error(
+                f"⚠️ Insufficient examination rooms. "
+                f"This seating mode requires {required_rooms} room(s), "
+                f"but only {len(available_rooms)} room(s) were uploaded. "
+                f"Please upload a room file containing more available rooms."
+            )
+            st.stop()
+
         start_generation = st.button(
-            "Generate Seating Arrangement",
-            type="primary",
+            "🎯 Generate Seating Plan",
             key=f"generate_seating_{selected_date}",
+            type="primary",
         )
 
-        retry_generation = st.session_state.pop(
-            "retry_seating_plan", False
-        )
+        retry_generation = st.session_state.get("retry_seating_plan", False)
 
         if start_generation or retry_generation:
-            if not available_rooms:
-                st.error(
-                    "⚠️ Please enter at least one available examination room."
-                )
-                st.stop()
-
-            if total_capacity < total_students:
-                st.error(
-                    f"⚠️ Insufficient seating capacity. "
-                    f"{total_students} students require seats, but only "
-                    f"{total_capacity} seats are available. "
-                    f"Please add more examination rooms."
-                )
-                st.stop()
-
             retry_number = (
                 0
                 if start_generation
                 else st.session_state.get("plan_retry_count", 0)
             )
+            st.session_state["retry_seating_plan"] = False
 
             with st.spinner("Calculating seating layout..."):
                 st.session_state.pop("seating_df", None)
@@ -487,13 +786,14 @@ if date_sheet_file and roster_file:
                         rows_per_room=rows_per_room,
                         desks_per_row=desks_per_row,
                         students_per_desk=students_per_desk,
-                        selected_pair=selected_pair,
+                        course_pairs=course_pairs,
+                        single_course_departments=single_course_departments,
                         department_subjects=department_subjects,
                         retry_number=retry_number,
                     )
                 )
 
-                st.session_state["selected_pair"] = selected_pair
+                st.session_state["course_pairs"] = course_pairs
 
     # ==========================================
     # SEATING PLAN RESULT
@@ -507,33 +807,32 @@ if date_sheet_file and roster_file:
                 "Please check your room capacity."
             )
         elif "seating_df" not in st.session_state:
-            selected_pair = st.session_state.get("selected_pair")
+            course_pairs = st.session_state.get("course_pairs", [])
             pairing_notes = find_pairing_violations(
                 candidate_plan,
-                selected_pair,
+                course_pairs,
             )
 
             # Pairing is a preference, not a hard conflict. Therefore,
             # show the teacher a confirmation only when a selected pair
             # could not be maintained for all desks because one course
             # became unavailable.
-            if pairing_notes and selected_pair:
+            if pairing_notes and course_pairs:
                 @st.dialog("ℹ️ Seating Pairing Notice")
                 def seating_pairing_dialog():
-                    pair_text = (
-                        f"{selected_pair[0]} + {selected_pair[1]}"
+                    pair_text = ", ".join(
+                        f"{a} + {b}" for a, b in course_pairs
                     )
 
                     st.write(
-                        f"You selected **{pair_text}** as the preferred "
-                        "course pairing."
+                        f"You selected these course pairs: **{pair_text}**."
                     )
 
                     st.write(
-                        "The pairing was used whenever students from "
-                        "both courses were available. After one course "
-                        "ran out, the remaining students were seated "
-                        "normally."
+                        "Each selected pair is kept in its own rooms. "
+                        "If one course in a pair has fewer students, the "
+                        "remaining students from that course are seated "
+                        "alone in unused seats."
                     )
 
                     st.dataframe(
@@ -601,7 +900,27 @@ if date_sheet_file and roster_file:
             width="stretch",
         )
 
-        seating_csv = st.session_state["seating_df"].to_csv(
+        # Show exactly which rooms belong to paired vs single-course seating.
+        if "Plan_Type" in st.session_state["seating_df"].columns:
+            st.markdown("### 🏫 Room Allocation Summary")
+            room_summary = (
+                st.session_state["seating_df"]
+                .groupby(["Room", "Plan_Type", "Course_Group"], sort=False)
+                .size()
+                .reset_index(name="Students")
+            )
+            st.dataframe(
+                room_summary,
+                hide_index=True,
+                width="stretch",
+            )
+            st.caption(
+                "🔒 Room protection is active: a room assigned to a Paired "
+                "course group is never reused for a Single course group."
+            )
+
+        seating_df_for_download = st.session_state["seating_df"].copy()
+        seating_csv = seating_df_for_download.to_csv(
             index=False
         ).encode("utf-8")
 
@@ -610,21 +929,116 @@ if date_sheet_file and roster_file:
                 "⚠️ The seating plan is ready to download."
             )
 
-            download_col, cancel_col = st.columns(2)
+            # --------------------------------------------------
+            # DOWNLOAD OPTIONS
+            # --------------------------------------------------
+            st.markdown("### 📥 Download Options")
+
+            download_col, range_col, cancel_col = st.columns([1, 1, 1])
 
             with download_col:
                 st.download_button(
-                    label="⬇️ Download Seating Plan (CSV)",
+                    label="⬇️ Download Whole Seating Plan",
                     data=seating_csv,
                     file_name=f"seating_plan_{selected_date}.csv",
                     mime="text/csv",
                     key="confirm_plan_download_button",
+                    use_container_width=True,
                 )
+
+            with range_col:
+                # Let the teacher choose exactly which course's room-wise
+                # roll-number ranges should be downloaded.
+                available_courses_for_range = sorted(
+                    seating_df_for_download["Department"]
+                    .dropna()
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )
+
+                selected_range_course = st.selectbox(
+                    "Course for Roll No. Range",
+                    available_courses_for_range,
+                    key=f"range_course_{selected_date}",
+                    help=(
+                        "Choose a course to see the starting and ending roll "
+                        "number seated in each room."
+                    ),
+                )
+
+                course_range_df = seating_df_for_download[
+                    seating_df_for_download["Department"].astype(str)
+                    == str(selected_range_course)
+                ].copy()
+
+                def roll_sort_key(value):
+                    value_str = str(value).strip()
+                    try:
+                        return (0, int(float(value_str)))
+                    except (ValueError, TypeError):
+                        return (1, value_str)
+
+                range_rows = []
+                for room, room_students in course_range_df.groupby(
+                    "Room", sort=False
+                ):
+                    roll_numbers = sorted(
+                        room_students["Roll_Number"]
+                        .dropna()
+                        .astype(str)
+                        .tolist(),
+                        key=roll_sort_key,
+                    )
+
+                    if not roll_numbers:
+                        continue
+
+                    range_rows.append({
+                        "Course": selected_range_course,
+                        "Room": room,
+                        "Starting Roll No": roll_numbers[0],
+                        "Ending Roll No": roll_numbers[-1],
+                        "Roll No Range": (
+                            f"{roll_numbers[0]} to {roll_numbers[-1]}"
+                        ),
+                        "Students in Room": len(roll_numbers),
+                    })
+
+                course_range_download_df = pd.DataFrame(range_rows)
+
+                if not course_range_download_df.empty:
+                    st.dataframe(
+                        course_range_download_df,
+                        hide_index=True,
+                        width="stretch",
+                    )
+
+                    course_range_csv = course_range_download_df.to_csv(
+                        index=False
+                    ).encode("utf-8")
+
+                    st.download_button(
+                        label=f"⬇️ Download {selected_range_course} Roll Ranges",
+                        data=course_range_csv,
+                        file_name=(
+                            f"{selected_range_course}_roll_ranges_"
+                            f"{selected_date}.csv"
+                        ),
+                        mime="text/csv",
+                        key=f"download_range_{selected_date}_{selected_range_course}",
+                        use_container_width=True,
+                    )
+                else:
+                    st.info(
+                        f"No seating information found for {selected_range_course}."
+                    )
 
             with cancel_col:
                 if st.button(
                     "No, cancel",
                     key="cancel_plan_download",
+                    use_container_width=True,
                 ):
                     st.session_state["confirm_plan_download"] = False
 
@@ -876,3 +1290,4 @@ else:
         "👋 Welcome! Please upload your CSV files in the sidebar "
         "to begin."
     )
+ 
